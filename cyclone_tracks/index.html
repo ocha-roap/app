@@ -108,6 +108,8 @@
   .chip.on{background:var(--accent-bg);border-color:var(--brand-primary);color:var(--brand-primary-text);font-weight:500}
   .subtle{font-size:11px;color:var(--faint);margin-top:7px;line-height:1.45}
   .count{font-size:13px;color:var(--ink);margin-top:12px}
+  .viewchk{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:var(--ink);cursor:pointer;margin-bottom:4px}
+  .viewchk input{accent-color:var(--brand-primary);width:16px;height:16px;cursor:pointer;flex:none;margin:1px 0 0}
   .count b{font-family:var(--font-cond);font-size:20px;font-weight:700;color:var(--brand-primary-text)}
   .source{font-size:11px;color:var(--faint);line-height:1.5}
 
@@ -198,6 +200,11 @@
       <div class="subtle" style="margin:-4px 0 14px">Applies to the Cyclone tracks layer only. El Niño episodes below are always shown in full.</div>
 
       <div class="field">
+        <label class="viewchk"><input type="checkbox" id="viewOnly" />Only storms in the map view</label>
+        <div class="subtle">Keeps storms with any part of the track inside the current map view. Counts and charts update as you pan and zoom.</div>
+      </div>
+
+      <div class="field">
         <div class="lbl" style="margin-bottom:6px">Basin</div>
         <div class="chips" id="basins"></div>
       </div>
@@ -233,7 +240,7 @@
         <div class="subtle">Shows the whole track of any storm that reached the selected category at any point.</div>
       </div>
 
-      <div class="count"><b id="stormCount">—</b> storms match</div>
+      <div class="count"><b id="stormCount">—</b> <span id="countLbl">storms match</span></div>
     </div>
 
     <!-- ── Block B: El Niño episodes and their monthly chart (self-contained) ── -->
@@ -250,7 +257,7 @@
       <div class="hist" id="epiHist"></div>
       <div class="mlabels"><span>J</span><span>F</span><span>M</span><span>A</span><span>M</span><span>J</span><span>J</span><span>A</span><span>S</span><span>O</span><span>N</span><span>D</span></div>
       <div class="subtle" id="epiHint">Enable an episode above to see its monthly cyclone counts.</div>
-      <div class="subtle">Complete Cat 3+ tracks — not affected by the filters above.</div>
+      <div class="subtle">Complete Cat 3+ tracks — not affected by the filters above, except <i>Only storms in the map view</i>.</div>
     </div>
 
     <div class="sec">
@@ -296,6 +303,11 @@
       part of a track meets a filter, the <b>whole track</b> is shown. So choosing Category 5
       draws the complete path of every storm that reached Cat 5 at any point — including its
       weaker genesis and decay stages.</p>
+
+      <p><b>Only storms in the map view</b> keeps a storm if any segment of its track
+      falls inside the current map view, and draws its whole track. It applies to the
+      Cyclone tracks layer, the storm count and month chart, and also to the El Niño
+      episode layers and their monthly chart. Everything updates when you pan or zoom.</p>
 
       <p>The <b>El Niño layers</b> isolate the strong and very-strong episodes since 1980
       (ranked by NOAA CPC's Oceanic Niño Index). Each shows storms that reached
@@ -441,7 +453,9 @@ const EPI_STORMS = {};           // episode id -> [{basin, months:[…]}] per di
 let EPI_BASINS = [];             // basins present across episodes (for the chips)
 const epiBasins = new Set();     // episode-block basin filter (independent of main filters)
 const filterState = { basins:new Set(), yearLo:null, yearHi:null, name:'',
-                      cats:new Set(), monthLo:1, monthHi:12 };
+                      cats:new Set(), monthLo:1, monthHi:12, inView:false };
+const SEG_BOX = {};              // layer id -> { box: Float32Array [x0,y0,x1,y1]*n, sid: [] } per line part
+let VIEW_SIDS = null;            // Set of SIDs touching the map view (null = no view constraint)
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  MAP
@@ -467,7 +481,7 @@ boot();
 async function loadOne(cfg){
   if (window.CYCLONE_DATA && window.CYCLONE_DATA[cfg.id]) return window.CYCLONE_DATA[cfg.id];
   const res = await fetch(cfg.url);
-  if (!res.ok) throw new Error(cfg.id + ' HTTP ' + res.status);
+  if (!res.ok) throw new Error(cfg.url + ' (HTTP ' + res.status + ')');
   return res.json();
 }
 async function boot(){
@@ -476,8 +490,9 @@ async function boot(){
     await Promise.all(lines.map(async c => { LAYER_DATA[c.id] = await loadOne(c); }));
     DATA = LAYER_DATA['tracks'];
   } catch (err) {
-    document.getElementById('status').innerHTML =
-      'Could not load track data.<br>Serve this folder over http:// (see README) — file:// fetch is blocked.';
+    document.getElementById('status').innerHTML = location.protocol === 'file:'
+      ? 'Could not load track data.<br>Serve this folder over http:// (see README) — file:// fetch is blocked.'
+      : 'Could not load track data.<br>' + String(err.message || err) + ' — check the file is in the published data/ folder.';
     console.error(err); return;
   }
   computeDerived();
@@ -527,10 +542,11 @@ function computeDerived(){
     }
     // inject the storm-level basin so the map can filter whole tracks by basin
     for (const f of LAYER_DATA[id].features){ const r = bySid[f.properties.SID]; if (r) f.properties.STORM_BASIN = r.basin; }
-    EPI_STORMS[id] = Object.values(bySid).map(r => ({ basin: r.basin, months: [...r.months] }));
+    EPI_STORMS[id] = Object.entries(bySid).map(([sid, r]) => ({ sid, basin: r.basin, months: [...r.months] }));
     Object.values(bySid).forEach(r => { if (r.basin) epiBasinSet.add(r.basin); });
   }
   EPI_BASINS = [...epiBasinSet].sort();
+  for (const id in LAYER_DATA) buildSegBoxes(id);
 
   computeDerived.basins = [...basins].sort();
   computeDerived.present = present;
@@ -541,6 +557,55 @@ function computeDerived(){
   computeDerived.yMin = yMin; computeDerived.yMax = yMax;
   document.getElementById('sideTitle').textContent = `IBTrACS best-track: ${yMin}–${yMax}`;
 }
+
+// one bounding box per line part (tracks are already split at ±180°), so the
+// map-view test is a cheap box overlap even over ~170k segments.
+function buildSegBoxes(id){
+  const boxes = [], sids = [];
+  for (const f of LAYER_DATA[id].features){
+    const g = f.geometry; if (!g) continue;
+    const parts = g.type === 'LineString' ? [g.coordinates] : g.type === 'MultiLineString' ? g.coordinates : [];
+    for (const line of parts){
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const c of line){ if (c[0] < x0) x0 = c[0]; if (c[0] > x1) x1 = c[0]; if (c[1] < y0) y0 = c[1]; if (c[1] > y1) y1 = c[1]; }
+      if (x0 === Infinity) continue;
+      boxes.push(x0, y0, x1, y1); sids.push(f.properties.SID);
+    }
+  }
+  SEG_BOX[id] = { box: Float32Array.from(boxes), sid: sids };
+}
+// SIDs (all layers) with any track part inside the current view; null when the
+// view spans the whole globe. Handles a view that crosses the antimeridian.
+function computeViewSids(){
+  const b = map.getBounds();
+  let w = b.getWest(), e = b.getEast();
+  const s = b.getSouth(), n = b.getNorth();
+  if (e - w >= 360) return null;
+  const shift = Math.floor((w + 180) / 360) * 360;      // bring west edge into [-180,180)
+  w -= shift; e -= shift;
+  const ranges = [[w, e]];
+  if (e > 180) ranges.push([w - 360, e - 360]);
+  const out = new Set();
+  for (const id in SEG_BOX){
+    const { box, sid } = SEG_BOX[id];
+    for (let i = 0, k = 0; k < sid.length; i += 4, k++){
+      if (box[i+3] < s || box[i+1] > n) continue;
+      for (const r of ranges){ if (box[i+2] >= r[0] && box[i] <= r[1]){ out.add(sid[k]); break; } }
+    }
+  }
+  return out;
+}
+function inViewOk(sid){ return !filterState.inView || !VIEW_SIDS || VIEW_SIDS.has(sid); }
+function viewExpr(){
+  return (filterState.inView && VIEW_SIDS) ? ['in', ['get','SID'], ['literal', [...VIEW_SIDS]]] : null;
+}
+function updateView(){
+  VIEW_SIDS = filterState.inView ? computeViewSids() : null;
+  applyMapFilter(); refreshStats(); applyEpisodeBasin();
+  document.getElementById('countLbl').textContent = filterState.inView ? 'storms match in view' : 'storms match';
+}
+let _viewTimer = null;
+map.on('moveend', () => { if (!filterState.inView || !DATA) return; clearTimeout(_viewTimer); _viewTimer = setTimeout(updateView, 120); });
 
 function accum(sid, p, isMain){
   let s = SUMMARIES[sid];
@@ -780,6 +845,7 @@ function buildFilter(){
     for (let m = s.monthLo; m <= s.monthHi; m++) any.push(['in', ',' + m + ',', ['coalesce', ['get','STORM_MONTHS'], '']]);
     f.push(any);
   }
+  const v = viewExpr(); if (v) f.push(v);
   return f;
 }
 function applyMapFilter(){
@@ -805,6 +871,7 @@ function refreshStats(){
   for (const sid in SUMMARIES){
     const st = SUMMARIES[sid];
     if (!st.main) continue;
+    if (!inViewOk(sid)) continue;
     if (s.basins.size && !s.basins.has(st.basin)) continue;
     if (st.yearMax < s.yearLo || st.yearMin > s.yearHi) continue;   // year-span overlap
     if (s.name && !(st.name||'').toUpperCase().includes(s.name.toUpperCase())) continue;
@@ -838,6 +905,7 @@ function renderEpisodeChart(){
     anyOn = true;
     for (const st of (EPI_STORMS[cfg.id] || [])){
       if (epiBasins.size && !epiBasins.has(st.basin)) continue;   // episode basin filter
+      if (!inViewOk(st.sid)) continue;                              // map-view option
       total++;
       st.months.forEach(m => combined[m]++);
     }
@@ -860,7 +928,10 @@ function renderEpisodeChart(){
 // Episode-block basin filter → constrains the episode map layers (whole track, by
 // genesis basin) and the monthly chart. Independent of the main-layer filters.
 function applyEpisodeBasin(){
-  const f = epiBasins.size ? ['in', ['get','STORM_BASIN'], ['literal', [...epiBasins]]] : null;
+  const parts = [];
+  if (epiBasins.size) parts.push(['in', ['get','STORM_BASIN'], ['literal', [...epiBasins]]]);
+  const v = viewExpr(); if (v) parts.push(v);
+  const f = parts.length ? ['all', ...parts] : null;
   for (const cfg of LAYERS){
     if (cfg.group !== 'elnino') continue;
     ['', '-hit'].forEach(sfx => { const lid = cfg.id + sfx; if (map.getLayer(lid)) map.setFilter(lid, f); });
@@ -990,6 +1061,10 @@ function buildFilters(){
   });
   fmtMonths();
 
+  const viewBox = document.getElementById('viewOnly');
+  viewBox.checked = filterState.inView;
+  viewBox.onchange = () => { filterState.inView = viewBox.checked; updateView(); };
+
   const nameInput = document.getElementById('name');
   nameInput.oninput = () => { filterState.name = nameInput.value.trim(); applyFilterLive(); };
 
@@ -1017,6 +1092,7 @@ function buildFilters(){
     filterState.yearLo = y0; filterState.yearHi = y1; yearSlider.set(y0, y1); fmtYears();
     filterState.monthLo = 1; filterState.monthHi = 12; monthSlider.set(1, 12); fmtMonths();
     clearCats();
+    filterState.inView = false; viewBox.checked = false; updateView();
     clearSelection();     // also drop any highlighted storm + detail card
     applyFilter();
   };
